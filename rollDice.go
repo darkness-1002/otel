@@ -39,8 +39,20 @@ func rolldice(w http.ResponseWriter, r *http.Request) {
 	span.SetAttributes(rollValueAttr)
 	rollCnt.Add(ctx, 1, metric.WithAttributes(rollValueAttr))
 
+	// Simulate failure on the first two attempts
+	if roll <= 3 {
+		// Intentional error for testing purposes
+		log.Println("Simulated failure in rolldice function")
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		panic("code phat gaya")
+
+		return
+
+	}
+
 	resp := strconv.Itoa(roll) + "\n"
 	if _, err := io.WriteString(w, resp); err != nil {
 		log.Printf("Write failed: %v\n", err)
 	}
+
 }

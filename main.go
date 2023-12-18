@@ -8,19 +8,22 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
 )
 
+const maxRetries = 3
+
 func main() {
-
-	
-
 	if err := run(); err != nil {
 		log.Fatalln(err)
 	}
 }
+
+// ...
 
 func run() (err error) {
 	// Handle SIGINT (CTRL+C) gracefully.
@@ -63,10 +66,28 @@ func run() (err error) {
 		stop()
 	}
 
-	// When Shutdown is called, ListenAndServe immediately returns ErrServerClosed.
-	err = srv.Shutdown(context.Background())
+	// Create a WaitGroup to wait for the server to finish processing existing requests.
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// Start a goroutine to gracefully shut down the server.
+	go func() {
+		defer wg.Done()
+
+		// When Shutdown is called, ListenAndServe immediately returns ErrServerClosed.
+		err = srv.Shutdown(context.Background())
+		if err != nil {
+			log.Printf("Error during server shutdown: %v\n", err)
+		}
+	}()
+
+	// Wait for the server to finish processing existing requests.
+	wg.Wait()
+
 	return
 }
+
+// ...
 
 func newHTTPHandler() http.Handler {
 	mux := http.NewServeMux()
@@ -80,9 +101,53 @@ func newHTTPHandler() http.Handler {
 	}
 
 	// Register handlers.
-	handleFunc("/rolldice", rolldice)
+	handleFunc("/rolldice", withRetry(rolldice, maxRetries))
 
 	// Add HTTP instrumentation for the whole server.
 	handler := otelhttp.NewHandler(mux, "/")
 	return handler
+}
+
+func withRetry(fn func(http.ResponseWriter, *http.Request), maxRetries int) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Create a span for the retry logic.
+		_, retrySpan := otel.Tracer("main").Start(r.Context(), "retry-span")
+		defer retrySpan.End()
+
+		var lastError error
+
+		// Initial retries
+		for retryCounter := 0; retryCounter < maxRetries; retryCounter++ {
+			// Create a span for each retry attempt.
+			_, attemptSpan := otel.Tracer("main").Start(r.Context(), "retry-attempt-span")
+			defer attemptSpan.End()
+
+			lastError = recoverFromPanic(func() {
+				fn(w, r)
+			})
+
+			if lastError == nil {
+				return // Function succeeded, return response
+			}
+
+			log.Printf("Retry %d failed with error: %v\n", retryCounter+1, lastError)
+			retrySpan.RecordError(lastError)
+
+			time.Sleep(time.Second) // Add a delay before retrying
+		}
+
+		// Log a message when reaching max retries
+		log.Println("Max retries reached, giving up.")
+		return
+	}
+}
+
+func recoverFromPanic(fn func()) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.New("panic occurred")
+		}
+	}()
+	fn()
+	return
 }
